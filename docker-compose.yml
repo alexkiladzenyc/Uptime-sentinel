@@ -1,0 +1,63 @@
+# One-command local stack:  docker compose up --build
+# UI and API on http://localhost:3000
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: sentinel
+      POSTGRES_PASSWORD: sentinel
+      POSTGRES_DB: sentinel
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U sentinel -d sentinel']
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  migrate:
+    build: .
+    image: uptime-sentinel:local
+    command: ['node', 'dist/bin/migrate.js']
+    environment: &env
+      DATABASE_URL: postgres://sentinel:sentinel@postgres:5432/sentinel
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+      DISCORD_WEBHOOK_URL: ${DISCORD_WEBHOOK_URL:-}
+      BASIC_AUTH_USER: ${BASIC_AUTH_USER:-}
+      BASIC_AUTH_PASSWORD: ${BASIC_AUTH_PASSWORD:-}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    image: uptime-sentinel:local
+    environment: *env
+    ports:
+      - '${PORT:-3000}:3000'
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ['CMD-SHELL', 'wget -qO- http://127.0.0.1:3000/api/health || exit 1']
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  worker:
+    image: uptime-sentinel:local
+    command: ['node', 'dist/bin/worker.js']
+    environment:
+      <<: *env
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
+    # Two workers by default, to show they share the queue safely.
+    # Scale with: docker compose up --scale worker=4
+    deploy:
+      replicas: 2
+    # Give in-flight checks time to finish on `docker compose stop`.
+    stop_grace_period: 30s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+volumes:
+  pgdata:
