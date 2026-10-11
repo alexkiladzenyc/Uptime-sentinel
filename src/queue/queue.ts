@@ -174,14 +174,18 @@ export async function reapExpired(
 export async function retryDead(db: Queryable, jobId: number): Promise<boolean> {
   try {
     const { rowCount } = await db.query(
-      `UPDATE jobs
+      `UPDATE jobs j
           SET status = 'available', attempts = 0, run_at = now(), finished_at = NULL, updated_at = now()
-        WHERE id = $1 AND status = 'dead'`,
+        WHERE j.id = $1 AND j.status = 'dead'
+          AND (j.dedupe_key IS NULL OR NOT EXISTS (
+            SELECT 1 FROM jobs other
+            WHERE other.dedupe_key = j.dedupe_key AND other.status IN ('available', 'running')))`,
       [jobId],
     );
     return rowCount === 1;
   } catch (err) {
-    if ((err as { code?: string }).code === '23505') return false; // dedupe_key unique violation
+    // Lost a race with a concurrent enqueue of the same dedupe key.
+    if ((err as { code?: string }).code === '23505') return false;
     throw err;
   }
 }
