@@ -33,7 +33,7 @@ that nothing is lost.
   closes the DNS-rebinding gap. Private, loopback, link-local, metadata, CGNAT
   and IPv6 transition ranges are blocked, and every redirect hop is
   re-checked.
-- **Tests against a real Postgres**: 146 unit and integration tests, plus a
+- **Tests against a real Postgres**: 147 unit and integration tests, plus a
   chaos test with real worker processes. All of them run in CI on every push,
   along with a Docker Compose smoke test that checks a real website.
 
@@ -186,7 +186,7 @@ docker run -d --name sentinel-test-db -p 5432:5432 \
   -e POSTGRES_PASSWORD=postgres -e POSTGRES_DB=sentinel_test postgres:16-alpine
 export TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/sentinel_test
 
-npm test              # unit + integration (146 tests)
+npm test              # unit + integration (147 tests)
 npm run test:chaos    # chaos test, ~10-15 s
 npm run lint && npm run typecheck
 ```

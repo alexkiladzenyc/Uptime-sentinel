@@ -80,8 +80,9 @@ export class Worker {
 
   /**
    * Stops claiming new jobs and waits up to `graceMs` for in-flight jobs.
-   * Jobs still running after that are aborted; their leases are left to
-   * expire so another worker picks them up.
+   * Jobs still running after that are aborted and recorded as failed
+   * attempts, so they are retried (with backoff) by another worker. If the
+   * process dies before that is recorded, lease expiry covers it.
    */
   async stop(graceMs = 25_000): Promise<void> {
     this.running = false;

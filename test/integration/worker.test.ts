@@ -172,4 +172,13 @@ describe('Worker', () => {
     expect((await jobWhen(first!, () => true)).status).toBe('succeeded');
     expect((await jobWhen(second!, () => true)).status).toBe('available');
   });
+  it('aborts jobs that outlast the grace period and records them for retry', async () => {
+    const worker = startWorker({ forever: () => new Promise(() => {}) });
+    const id = await queue.enqueue(pool, 'forever', {}, { maxAttempts: 3 });
+    await jobWhen(id!, (j) => j.status === 'running');
+    await worker.stop(100);
+
+    const job = await jobWhen(id!, () => true);
+    expect(job).toMatchObject({ status: 'available', attempts: 1, last_error: 'worker stopping' });
+  });
 });
