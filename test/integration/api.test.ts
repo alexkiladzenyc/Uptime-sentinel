@@ -229,6 +229,8 @@ describe('app shell', () => {
     try {
       expect((await withWeb.inject({ url: '/' })).body).toBe('<html>spa</html>');
       expect((await withWeb.inject({ url: '/monitors/12' })).body).toBe('<html>spa</html>');
+      const missingAsset = await withWeb.inject({ url: '/assets/old-bundle.js' });
+      expect(missingAsset.statusCode).toBe(404);
       const missingApi = await withWeb.inject({ url: '/api/nope' });
       expect(missingApi.statusCode).toBe(404);
       expect(missingApi.json()).toEqual({ error: 'not found' });
