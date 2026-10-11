@@ -1,0 +1,97 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Lint, typecheck and test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: sentinel_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/sentinel_test
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: |
+            package-lock.json
+            web/package-lock.json
+      - run: npm ci
+      - run: npm --prefix web ci
+      - name: Lint and format check
+        run: npm run lint
+      - name: Typecheck (backend and web)
+        run: npm run typecheck
+      - name: Unit and integration tests (real Postgres)
+        run: npm test
+      - name: Chaos test (SIGKILLs worker processes mid-run)
+        run: npm run test:chaos
+      - name: Build
+        run: npm run build && npm run build:web
+
+  docker:
+    name: Docker Compose smoke test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Start the stack
+        run: docker compose up -d --build
+      - name: Wait for the API
+        run: |
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:3000/api/health && exit 0
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Create a monitor and wait for its first check
+        run: |
+          curl -sf -X POST http://localhost:3000/api/monitors \
+            -H 'content-type: application/json' \
+            -d '{"name":"Example","url":"https://example.com/"}'
+          echo
+          for i in $(seq 1 30); do
+            body=$(curl -sf http://localhost:3000/api/monitors/1)
+            if echo "$body" | grep -q '"lastCheckedAt":"'; then
+              echo "$body" | head -c 600; echo
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs worker
+          exit 1
+      - name: SSRF guard rejects an internal URL
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:3000/api/monitors \
+            -H 'content-type: application/json' \
+            -d '{"name":"Metadata","url":"http://169.254.169.254/latest/meta-data/"}')
+          test "$status" = 400
+      - name: Logs
+        if: always()
+        run: docker compose logs --no-color | tail -n 100
+      - name: Tear down
+        if: always()
+        run: docker compose down -v
