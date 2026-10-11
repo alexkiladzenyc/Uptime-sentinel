@@ -85,7 +85,7 @@ export function MonitorsPage() {
 function AddMonitorForm({ onCreated }: { onCreated: () => void }) {
   const [name, setName] = useState('');
   const [url, setUrl] = useState('https://');
-  const [interval, setInterval] = useState(60);
+  const [intervalSeconds, setIntervalSeconds] = useState(60);
   const [webhookUrl, setWebhookUrl] = useState('');
   const [error, setError] = useState<string>();
   const [busy, setBusy] = useState(false);
@@ -98,7 +98,7 @@ function AddMonitorForm({ onCreated }: { onCreated: () => void }) {
       await api.createMonitor({
         name: name || new URL(url).hostname,
         url,
-        intervalSeconds: interval,
+        intervalSeconds,
         webhookUrl: webhookUrl.trim() || null,
       });
       setName('');
@@ -132,8 +132,8 @@ function AddMonitorForm({ onCreated }: { onCreated: () => void }) {
         <label htmlFor="interval">Check every</label>
         <select
           id="interval"
-          value={interval}
-          onChange={(e) => setInterval(Number(e.target.value))}
+          value={intervalSeconds}
+          onChange={(e) => setIntervalSeconds(Number(e.target.value))}
         >
           <option value={30}>30 seconds</option>
           <option value={60}>1 minute</option>

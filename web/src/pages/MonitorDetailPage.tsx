@@ -143,8 +143,8 @@ export function MonitorDetailPage() {
               </tr>
             </thead>
             <tbody>
-              {checks.slice(0, 20).map((c) => (
-                <tr key={c.checkedAt}>
+              {checks.slice(0, 20).map((c, i) => (
+                <tr key={`${c.checkedAt}-${i}`}>
                   <td title={formatDateTime(c.checkedAt)}>{timeAgo(c.checkedAt)}</td>
                   <td>{c.ok ? 'OK' : <span className="error-text">{c.error}</span>}</td>
                   <td className="num">{c.statusCode ?? '—'}</td>
