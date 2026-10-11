@@ -4,12 +4,6 @@
 
 **Uptime and TLS-certificate monitoring, running on a crash-safe job queue built from scratch on Postgres.**
 
-<!-- TODO: replace with a real screenshot, e.g. docs/screenshot.png -->
-
-> 📸 **Screenshot:** _coming soon_
->
-> 🌐 **Live demo:** _coming soon_
-
 Add a URL and Uptime Sentinel checks it on a schedule. It records status codes,
 response times and certificate expiry, opens an incident when a site goes down,
 and posts to a Discord webhook when the site goes down, comes back up, or its
