@@ -2,34 +2,16 @@
 
 [![CI](https://github.com/alexkiladzenyc/Uptime-sentinel/actions/workflows/ci.yml/badge.svg)](https://github.com/alexkiladzenyc/Uptime-sentinel/actions/workflows/ci.yml)
 
-**Uptime and TLS-certificate monitoring, running on a crash-safe job queue built from scratch on Postgres.**
+An uptime and TLS-certificate monitor. You give it a URL, it checks it on a schedule, records the status code, response time and certificate expiry, opens an incident when the site goes down, and posts to Discord when it goes down, comes back, or the certificate is about to expire.
 
-Add a URL and Uptime Sentinel checks it on a schedule. It records status codes,
-response times and certificate expiry, opens an incident when a site goes down,
-and posts to a Discord webhook when the site goes down, comes back up, or its
-TLS certificate is close to expiring.
+Honestly, the monitoring is the easy part. What I really wanted to build was the thing underneath it: a background job queue written from scratch on Postgres, with no queue library. It retries with exponential backoff, has a dead-letter queue, and keeps working when workers crash. To prove that last part there's a chaos test that `SIGKILL`s worker processes in the middle of jobs and then checks that nothing got lost or done twice.
 
-The monitoring app showcases the part underneath: a **background job system
-written from scratch on Postgres, with no queue libraries**. It survives
-worker crashes, retries with exponential backoff, has a dead-letter queue, and
-is tested by a chaos test that `SIGKILL`s worker processes mid-job and checks
-that nothing is lost.
+## What's in here
 
-## Highlights
-
-- **Postgres job queue**: `FOR UPDATE SKIP LOCKED` claims, leases with heartbeats,
-  fencing tokens against zombie workers, exponential backoff with jitter, a
-  dead-letter queue with manual retry, and graceful shutdown.
-- **Effectively-once database effects**: a handler's writes and the job's
-  completion commit in one transaction. Alerts use a transactional outbox, so
-  an incident and its alert job are always written together.
-- **SSRF protection**: user URLs are validated at socket-connect time, which
-  closes the DNS-rebinding gap. Private, loopback, link-local, metadata, CGNAT
-  and IPv6 transition ranges are blocked, and every redirect hop is
-  re-checked.
-- **Tests against a real Postgres**: 147 unit and integration tests, plus a
-  chaos test with real worker processes. All of them run in CI on every push,
-  along with a Docker Compose smoke test that checks a real website.
+- A job queue on plain Postgres: `FOR UPDATE SKIP LOCKED` to claim jobs, leases with heartbeats, fencing tokens so a stalled worker can't overwrite someone else's result, backoff with jitter, a dead-letter queue you can retry from, and graceful shutdown.
+- A handler's database writes and the job's completion commit in the same transaction. Alerts go through a transactional outbox, so an incident and its alert job are always written together or not at all.
+- SSRF protection that checks the address at the moment the socket connects, which closes the DNS-rebinding gap. Private, loopback, link-local, cloud metadata, CGNAT and the IPv6 transition ranges are all blocked, and every redirect is checked again.
+- 147 unit and integration tests against a real Postgres, the chaos test with real worker processes, and a Docker Compose smoke test that monitors an actual website. CI runs all of it on every push.
 
 ## Architecture
 
@@ -51,10 +33,7 @@ flowchart LR
     loop -->|send_alert| discord([Discord webhook])
 ```
 
-There are three process types, all built from one Docker image: the **API** (also
-serves the React UI), any number of **workers**, and a one-shot **migrate**
-container. Workers coordinate only through Postgres. There is no leader and no
-broker, and every worker runs the scheduler and the reaper safely.
+Everything is built from one Docker image and runs as three kinds of process: the API (which also serves the React dashboard), as many workers as you like, and a one-off migrate step. Workers only coordinate through Postgres. There's no leader and no message broker, and it's safe for every worker to run the scheduler and the reaper at the same time.
 
 ### How the queue works
 
@@ -69,63 +48,36 @@ stateDiagram-v2
     dead --> available: manual retry
 ```
 
-1. **Claim.** A worker runs one `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP
-LOCKED)`. It marks jobs `running`, increments `attempts`, and sets a
-   **lease** (`lease_expires_at`) plus a random **lease token**.
-2. **Heartbeat.** While a job runs, the worker extends its lease every
-   lease/3. If the worker dies, the heartbeats stop.
-3. **Reap.** Every worker periodically moves `running` jobs with expired leases
-   back to `available` (after a backoff) or to `dead` if that was their last
-   attempt. Because attempts are counted at claim time, a job that crashes its
-   worker every time still reaches the dead-letter queue.
-4. **Fence.** `complete`, `fail` and `heartbeat` all require the current lease
-   token. A worker that stalled past its lease (a "zombie") can't overwrite the
-   result of the worker that took the job over.
-5. **Complete in a transaction.** `ctx.completeWith(fn)` locks the job row,
-   checks the token, runs the handler's writes, and marks the job succeeded,
-   all in one transaction.
+A worker claims jobs with a single `UPDATE … WHERE id IN (SELECT … FOR UPDATE SKIP LOCKED)`. That marks them `running`, bumps `attempts`, and gives each one a lease (`lease_expires_at`) and a random lease token.
 
-**Delivery guarantee:** at-least-once execution. Database side effects are
-effectively-once when they go through `completeWith`. Side effects outside
-the database (the Discord POST) are at-least-once: a crash between Discord
-accepting a message and the commit means that message is sent again. See
-[`docs/decisions.md`](docs/decisions.md) for the reasoning and the
-alternatives.
+While a job runs, the worker extends the lease every third of the lease length. If the worker dies, the heartbeats stop and the lease runs out.
+
+Every worker also runs a reaper that looks for `running` jobs with expired leases and puts them back to `available` after a backoff, or moves them to `dead` if that was their last attempt. Attempts are counted when a job is claimed, not when it finishes, so a job that kills its worker every single time still ends up in the dead-letter queue instead of looping forever.
+
+`complete`, `fail` and `heartbeat` all need the current lease token. If a worker stalls past its lease and another worker picks the job up, the first one's late result is rejected.
+
+Handlers that write to the database use `ctx.completeWith(fn)`, which locks the job row, checks the token, runs the handler's writes and marks the job succeeded in one transaction.
+
+What that adds up to: jobs run at least once. Database side effects that go through `completeWith` happen effectively once. Anything outside the database, which here means the Discord message, is at-least-once, so if a worker crashes after Discord accepts a message but before the commit, the message gets sent again. I go through why I settled on that, and what I'd have to do to avoid it, in [`docs/decisions.md`](docs/decisions.md).
 
 ### What a check does
 
-`check_monitor` fetches the URL through the SSRF-safe client (outside any
-transaction). Then, in the transaction that completes the job, it stores the
-result, updates the monitor's state (it goes down only after N consecutive
-failures, set per monitor), opens or resolves the incident, and inserts any
-alert rows **plus their `send_alert` jobs**. Alerts are deduplicated by key
-(`incident:42:down`, `cert:7:2026-01-31`), so a re-run never alerts twice for
-the same event.
+`check_monitor` fetches the URL through the SSRF-safe client, outside any transaction. Then, in the transaction that completes the job, it saves the result, updates the monitor's state (a monitor only counts as down after N failures in a row, configurable per monitor), opens or closes the incident, and inserts any alerts along with their `send_alert` jobs. Alerts have a dedupe key like `incident:42:down` or `cert:7:2026-01-31`, so running the same check twice never sends the same alert twice.
 
 ### SSRF protection
 
-Users submit URLs that the server fetches, so a naive implementation could be
-used to reach `http://169.254.169.254/` (cloud credentials),
-`http://localhost:5432` or anything else on the internal network.
+The server fetches URLs that users type in, so a careless version of this would happily fetch `http://169.254.169.254/` (cloud credentials), `http://localhost:5432`, or anything else on the internal network. Here's what stops that:
 
-- Only `http`/`https` are allowed, and URLs with embedded credentials are refused.
-- Hostnames are resolved **inside the socket's `lookup` hook**, so the address
-  that is validated is the address that gets connected to. A rebinding DNS
-  server can't hand out a different address between the check and the connect.
-- If **any** address in the DNS answer is non-public, the request is refused.
-  Only plain public unicast passes. This blocks loopback, RFC 1918, link-local
-  and metadata, CGNAT, multicast, reserved and documentation ranges, IPv6
-  ULA, IPv4-mapped IPv6, NAT64, 6to4 and Teredo.
-- IP-literal hosts (including `http://2130706433/` and `http://0x7f.1/`, which
-  normalise to `127.0.0.1`) and every redirect hop go through the same checks.
-- Each request has a total deadline, a maximum of 5 redirects, and a 1 MiB
-  limit on how much of the body is read.
-- Discord webhook URLs must match Discord's exact webhook URL format and are
-  never shown again after they're saved.
+- Only `http` and `https` are allowed, and URLs with a username or password in them are refused.
+- The hostname is resolved inside the socket's `lookup` hook, so the address I validate is the address that actually gets connected to. A rebinding DNS server doesn't get a chance to swap it in between.
+- If any address in the DNS answer isn't public, the whole request is refused. That covers loopback, RFC 1918, link-local and metadata, CGNAT, multicast, reserved and documentation ranges, IPv6 ULA, IPv4-mapped IPv6, NAT64, 6to4 and Teredo.
+- IP-literal hosts get the same checks, including the sneaky ones like `http://2130706433/` and `http://0x7f.1/` that both mean `127.0.0.1`. So does every redirect.
+- Each request has an overall deadline, at most 5 redirects, and only reads the first 1 MiB of the body.
+- Discord webhook URLs have to match Discord's exact format, and they're never shown again once saved.
 
 ## Running it
 
-**Requirements:** Docker with Compose v2.
+You need Docker with Compose v2.
 
 ```sh
 git clone https://github.com/alexkiladzenyc/Uptime-sentinel.git
@@ -133,12 +85,9 @@ cd Uptime-sentinel
 docker compose up --build
 ```
 
-Open <http://localhost:3000> and add a URL. Checks start within a few
-seconds. This starts Postgres, runs migrations, and starts the API and two
-worker replicas (`docker compose up --scale worker=4` for more).
+Then open <http://localhost:3000> and add a URL. Checks start within a few seconds. Compose starts Postgres, runs the migrations, and brings up the API and two workers. `docker compose up --scale worker=4` if you want more.
 
-To get alerts in Discord, create a webhook (_Server Settings → Integrations →
-Webhooks_) and either paste it into a monitor or set it as the default:
+For Discord alerts, make a webhook (Server Settings → Integrations → Webhooks) and either paste it into a monitor or set it as the default for all of them:
 
 ```sh
 DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/…' docker compose up --build
@@ -146,20 +95,20 @@ DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/…' docker compose up --b
 
 ### Configuration
 
-| Variable                                  | Default    | Purpose                                                      |
-| ----------------------------------------- | ---------- | ------------------------------------------------------------ |
-| `DATABASE_URL`                            | (required) | Postgres connection string                                   |
-| `PORT`                                    | `3000`     | API / UI port                                                |
-| `DISCORD_WEBHOOK_URL`                     | unset      | Default webhook for monitors without their own               |
-| `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` | unset      | Protect the UI and API with HTTP Basic auth                  |
-| `WORKER_CONCURRENCY`                      | `4`        | Jobs each worker runs at once                                |
-| `WORKER_POLL_INTERVAL_MS`                 | `1000`     | Idle poll interval                                           |
-| `JOB_LEASE_MS`                            | `30000`    | Lease length; a crashed worker's jobs are retried after this |
-| `SCHEDULER_ENABLED`                       | `true`     | Run the scheduler tick in this worker                        |
-| `MAX_MONITORS`                            | `200`      | Upper bound on monitors                                      |
-| `LOG_LEVEL`                               | `info`     | Pino log level                                               |
+| Variable                                  | Default  | What it does                                                           |
+| ----------------------------------------- | -------- | ---------------------------------------------------------------------- |
+| `DATABASE_URL`                            | required | Postgres connection string                                             |
+| `PORT`                                    | `3000`   | Port for the API and UI                                                |
+| `DISCORD_WEBHOOK_URL`                     | unset    | Default webhook for monitors that don't have their own                 |
+| `BASIC_AUTH_USER` / `BASIC_AUTH_PASSWORD` | unset    | Put the UI and API behind HTTP Basic auth                              |
+| `WORKER_CONCURRENCY`                      | `4`      | How many jobs each worker runs at once                                 |
+| `WORKER_POLL_INTERVAL_MS`                 | `1000`   | How often an idle worker polls                                         |
+| `JOB_LEASE_MS`                            | `30000`  | Lease length, i.e. how long before a crashed worker's jobs get retried |
+| `SCHEDULER_ENABLED`                       | `true`   | Whether this worker runs the scheduler                                 |
+| `MAX_MONITORS`                            | `200`    | Maximum number of monitors                                             |
+| `LOG_LEVEL`                               | `info`   | Pino log level                                                         |
 
-### Local development (without Docker for the app)
+### Running the app without Docker
 
 ```sh
 npm ci && npm --prefix web ci
@@ -173,7 +122,7 @@ npm --prefix web run dev                  # http://localhost:5173 (UI, proxies /
 
 ## Testing
 
-Tests need a Postgres database whose name ends in `_test` (the setup wipes it):
+The tests need a Postgres database whose name ends in `_test`, because the setup wipes it:
 
 ```sh
 docker run -d --name sentinel-test-db -p 5432:5432 \
@@ -181,95 +130,64 @@ docker run -d --name sentinel-test-db -p 5432:5432 \
 export TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/sentinel_test
 
 npm test              # unit + integration (147 tests)
-npm run test:chaos    # chaos test, ~10-15 s
+npm run test:chaos    # the chaos test, takes 10-15 seconds
 npm run lint && npm run typecheck
 ```
 
-| Suite           | What it covers                                                                                                                                                                                                                                                                             |
-| --------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
-| **Unit**        | Backoff math; the monitor state machine; the IP policy (28 blocked and 5 allowed cases); URL parsing tricks; the SSRF-safe client against real local HTTP/TLS servers (DNS rebinding, redirect hops, timeouts, body cap, certificates); the Discord client                                 |
-| **Integration** | Queue primitives against real Postgres (concurrent claims never overlap, backoff, DLQ, lease expiry, fencing, transactional completion); the Worker (retries, timeouts, heartbeats, concurrency limit, graceful stop); end-to-end checks → incidents → alerts; the scheduler; the REST API |
-| **Chaos**       | 4 worker processes drain 400 jobs while the test `SIGKILL`s a random worker every 150–400 ms and starts a replacement                                                                                                                                                                      |
+The unit tests cover the backoff math, the monitor state machine, the IP policy (28 blocked and 5 allowed cases), URL parsing tricks, the Discord client, and the SSRF-safe client against real local HTTP and TLS servers (DNS rebinding, redirects, timeouts, the body cap, certificates).
 
-**Chaos test invariants:** every job ends `succeeded` or `dead`, with none lost
-or stuck. Poison jobs are dead-lettered with their attempts used up. Every
-succeeded job's side effect is committed **exactly once** (the effects table
-deliberately has no unique constraint, so a duplicate would show up). The test
-also asserts that the chaos was real: some kills hit workers holding running
-jobs, and those jobs were re-run.
+The integration tests run against a real Postgres: concurrent claims never overlapping, backoff, the dead-letter queue, lease expiry, fencing, transactional completion, the worker itself (retries, timeouts, heartbeats, concurrency limit, graceful stop), the full check → incident → alert path, the scheduler, and the REST API.
 
-**Results so far.** In 5 consecutive local runs (Vitest 5, Postgres 16), every
-run passed: 12–16 kills per run, 11–14 of them hitting a worker with running
-jobs, 27–32 jobs re-run after a crash, 0 lost, 0 duplicate effects. The test
-also runs in CI on every push. To check that the test can fail, I disabled the
-reaper and ran it: 42 jobs were left stuck in `running` and it failed, as it should.
+### The chaos test
 
-**CI** (`.github/workflows/ci.yml`) runs lint, typecheck, unit and integration
-tests, the chaos test, the build, and a Docker Compose smoke test. The smoke
-test brings the stack up, adds `https://example.com` as a monitor, waits for a
-real check to complete, and confirms the API rejects a metadata-service URL. On
-the first CI run, that check came back up (HTTP 200) with the certificate
-expiry recorded.
+Four worker processes work through 400 jobs while the test `SIGKILL`s a random one every 150–400 ms and starts a replacement. At the end it checks that:
+
+- every job finished as `succeeded` or `dead`, with nothing lost or stuck,
+- the poison jobs ended up dead-lettered with all their attempts used,
+- every succeeded job's side effect was committed exactly once (the effects table has no unique constraint on purpose, so a duplicate would actually show up),
+- the chaos was real: some kills landed on workers that were in the middle of jobs, and those jobs got re-run.
+
+I ran it 5 times in a row locally (Vitest 5, Postgres 16) and it passed every time, with 12–16 kills per run, 11–14 of them hitting a busy worker, 27–32 jobs re-run after a crash, nothing lost and no duplicate effects. To make sure the test could actually fail, I turned the reaper off and ran it again. 42 jobs were left stuck in `running` and it failed, which is what should happen.
+
+### CI
+
+`.github/workflows/ci.yml` runs lint, typecheck, the unit and integration tests, the chaos test, the build, and a Docker Compose smoke test. The smoke test starts the whole stack, adds `https://example.com` as a monitor, waits for a real check to finish, and makes sure the API refuses a metadata-service URL. The first time it ran in CI the check came back up (HTTP 200) with the certificate expiry recorded.
 
 ## Project layout
 
 ```
 src/
-  queue/          The job queue: SQL primitives, Worker, backoff, types
+  queue/          the job queue: SQL primitives, Worker, backoff, types
   net/            SSRF-safe HTTP client and IP policy
-  monitoring/     Check logic, state machine, job handlers, scheduler, Discord
+  monitoring/     check logic, state machine, job handlers, scheduler, Discord
   api/            Fastify routes (monitors, queue/DLQ) and app wiring
-  bin/            Entrypoints: api, worker, migrate
-migrations/       Plain SQL migrations
+  bin/            entrypoints: api, worker, migrate
+migrations/       plain SQL migrations
 web/              React + Vite dashboard
 test/
   unit/  integration/  chaos/
-docs/decisions.md Design decisions and tradeoffs
+docs/decisions.md design decisions and tradeoffs
 ```
 
 ## Limitations
 
-These are the ones I know about. Some were cut deliberately to keep the
-project finished and verifiable.
+These are the ones I know about. Some I left out on purpose so I could finish the project and properly test what's there.
 
-- **Single tenant.** There are no user accounts: one shared set of monitors,
-  optionally behind HTTP Basic auth. The API has no rate limiting.
-- **Discord alerts are at-least-once.** A worker crash between Discord
-  accepting a message and the commit causes a duplicate message (see §4 of
-  the decisions doc).
-- **No performance claims.** I haven't load-tested or benchmarked the queue,
-  so I make no throughput or latency claims. Polling plus per-job database
-  writes will hit a ceiling well before a dedicated broker would.
-- **Pickup latency.** Idle workers poll every second, and the scheduler ticks
-  every 5 seconds, so a check can start a few seconds after it's due. The
-  schedule also drifts (`next_check_at = now() + interval`).
-- **Checks are simple.** One region, `GET` only, and up means a final status of
-  200–399. No keyword or body assertions, custom headers or HEAD requests.
-- **Certificate handling.** The recorded certificate is the one for the final
-  URL after redirects. Certificates the client rejects (expired, self-signed)
-  make the check fail, but their expiry date isn't recorded.
-- **No egress proxy support.** The SSRF guard relies on making the connection
-  itself, so checks can't go through an HTTP proxy without moving the guard
-  there. Ports aren't restricted, so public hosts' ports can be probed.
-- **Secrets at rest.** Webhook URLs (which contain a token) are stored in
-  plaintext in Postgres. The API never returns them.
-- **Retention.** Succeeded jobs are pruned after 24 hours and check results
-  after 30 days. Dead jobs stay until someone retries or deletes them.
-- **UI tests.** The React UI has no automated tests. I checked it manually in
-  headless Chromium (light/dark mode, desktop and 390 px mobile).
-- **Verification gaps.** I developed this in a sandbox without outbound
-  internet, so all local checks used local test servers. The real-internet
-  path (DNS, TLS to a public site) is verified only by the CI smoke test
-  against `https://example.com`. I couldn't run the multi-stage `docker build`
-  locally either (no registry access for `npm ci`), so the Dockerfile is
-  verified by CI. Locally I tested the same runtime layout with Compose.
+- It's single-tenant. There are no user accounts, just one shared set of monitors, optionally behind Basic auth. The API has no rate limiting.
+- Discord alerts are at-least-once. A worker crashing between Discord accepting a message and the commit means a duplicate message (section 4 of the decisions doc).
+- I haven't load-tested or benchmarked the queue, so I'm not claiming any throughput or latency numbers. Polling plus per-job database writes will hit a ceiling a lot sooner than a dedicated broker would.
+- Idle workers poll every second and the scheduler ticks every 5 seconds, so a check can start a few seconds late. The schedule also drifts a little, since `next_check_at = now() + interval`.
+- Checks are basic: one region, `GET` only, and "up" means a final status of 200–399. No keyword or body checks, custom headers or HEAD requests.
+- The certificate it records is the one for the final URL after redirects. If the client rejects a certificate (expired, self-signed) the check fails, but that certificate's expiry date isn't saved.
+- It can't go through an HTTP proxy, because the SSRF guard depends on making the connection itself. Ports aren't restricted either, so ports on public hosts can be probed.
+- Webhook URLs contain a token and are stored in plain text in Postgres. The API never returns them.
+- Succeeded jobs are deleted after 24 hours and check results after 30 days. Dead jobs stay until someone retries or deletes them.
+- The React UI has no automated tests. I checked it by hand in headless Chromium in light and dark mode, on desktop and at 390 px wide.
+- My development environment had no outbound internet, so every local check ran against local test servers. The real-internet path (public DNS, TLS to a real site) is only verified by the CI smoke test against `https://example.com`. I also couldn't run the multi-stage `docker build` locally because `npm ci` couldn't reach the registry, so the Dockerfile is verified in CI. Locally I tested the same runtime layout with Compose.
 
 ## Design decisions
 
-Every major choice (Postgres as a queue, leases and fencing, polling versus
-LISTEN/NOTIFY, the outbox, SSRF strategy, raw SQL, testing approach) is
-written up with the alternatives and tradeoffs in
-[**docs/decisions.md**](docs/decisions.md).
+I wrote up every major choice (Postgres as a queue, leases and fencing, polling versus LISTEN/NOTIFY, the outbox, the SSRF approach, raw SQL, how it's tested) with the alternatives I considered and the tradeoffs in [docs/decisions.md](docs/decisions.md).
 
 ## License
 
